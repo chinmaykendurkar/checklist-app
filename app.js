@@ -513,7 +513,7 @@ function buildMenu() {
     }, "danger");
   }
   btn("Export backup (file)", exportData);
-  btn("Import backup", importData);
+  btn("Import checklists (file)", importData);
   btn("Sign out", signOutFlow);
 }
 
@@ -528,9 +528,14 @@ function importData() {
     try {
       const data = JSON.parse(await inp.files[0].text());
       if (!Array.isArray(data.lists)) throw new Error("bad format");
-      if (!confirm("Replace all current checklists with this backup?")) return;
-      state = migrate(data);
-      state.lists.forEach(touch);   // mark as new edits so they upload
+      const incoming = migrate(data).lists;
+      if (!confirm(`Add ${incoming.length} checklist(s) from this file? Your current checklists are kept.`)) return;
+      // Add to what's already here. A list with the same id (same backup imported twice) is updated, not duplicated.
+      for (const l of incoming) {
+        touch(l);                     // mark as a new edit so it uploads
+        const i = state.lists.findIndex(x => x.id === l.id);
+        if (i >= 0) state.lists[i] = l; else state.lists.push(l);
+      }
       save(); currentListId = null; render();
     } catch (e) { alert("That file doesn't look like a valid backup."); }
   };
