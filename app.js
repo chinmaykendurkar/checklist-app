@@ -17,20 +17,30 @@ function load() {
   return migrate(data);
 }
 // Make older saved data (no colors yet) work with the newer app.
+function normalizeList(l, i) {
+  l.items = Array.isArray(l.items) ? l.items : [];
+  const old = OLD_COLORS.indexOf(l.color);
+  if (old >= 0) l.color = COLORS[old];
+  if (!l.color) l.color = COLORS[i % COLORS.length];
+  if (!l.updated) l.updated = Date.now() - i;
+  return l;
+}
 function migrate(data) {
   if (!data || !Array.isArray(data.lists)) return { lists: [] };
-  data.lists.forEach((l, i) => {
-    l.items = Array.isArray(l.items) ? l.items : [];
-    const old = OLD_COLORS.indexOf(l.color);
-    if (old >= 0) l.color = COLORS[old];
-    if (!l.color) l.color = COLORS[i % COLORS.length];
-    if (!l.updated) l.updated = Date.now() - i;
-  });
+  data.lists.forEach(normalizeList);
   return data;
 }
-function save() {
+function loadJSON(key, fallback) {
+  try { return JSON.parse(localStorage.getItem(key)) ?? fallback; } catch (e) { return fallback; }
+}
+// saveLocal: keep a copy on this device (works offline).  save: also send changes to the cloud.
+function saveLocal() {
   try { localStorage.setItem(KEY, JSON.stringify(state)); }
   catch (e) { alert("Could not save data (storage full or blocked)."); }
+}
+function save() {
+  saveLocal();
+  schedulePush();
 }
 const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
 
@@ -47,6 +57,118 @@ const menuBtn = document.getElementById("menuBtn");
 const menu = document.getElementById("menu");
 const fab = document.getElementById("fab");
 const dlg = document.getElementById("dlg");
+
+// ---------- Cloud sync ----------
+// Every list is stored as its own document in the cloud: users/<you>/lists/<listId>.
+// The newest edit of a list wins. `synced` remembers, per list, which version the cloud has,
+// so we only upload what changed and can tell when a list was deleted on another device.
+const syncEl = document.getElementById("sync");
+const SYNCED_KEY = "checklists-synced-v2";
+let cloud = null;            // the cloud.js module, once loaded
+let cloudError = false;      // true if it could not be loaded (e.g. no internet on first visit)
+let user = null;             // signed-in user, or null
+let authReady = false;       // true once we know whether someone is signed in
+let unsubscribe = null;
+let gotSnapshot = false;     // don't upload before we've seen what the cloud already has
+let pushTimer = null;
+let pending = 0;             // uploads in flight
+const synced = loadJSON(SYNCED_KEY, {});   // { listId: updatedStampLastSynced }
+
+function saveSynced() {
+  try { localStorage.setItem(SYNCED_KEY, JSON.stringify(synced)); } catch (e) { /* ignore */ }
+}
+function updateSync() {
+  if (!syncEl) return;
+  const s = !user ? "" : !navigator.onLine ? "off" : pending > 0 ? "busy" : "ok";
+  syncEl.className = "sync " + s;
+  syncEl.title = { ok: "Synced", busy: "Syncing…", off: "Offline: changes will sync later", "": "" }[s];
+}
+function track(promise, id, kind) {
+  pending++; updateSync();
+  promise.catch(e => {
+    console.warn("Sync failed", e);
+    if (kind === "push") delete synced[id];      // try again next time
+    else synced[id] = -1;                         // retry the removal next time
+    saveSynced();
+  }).finally(() => { pending--; updateSync(); });
+}
+function schedulePush() {
+  if (!user || !cloud || !gotSnapshot) return;
+  clearTimeout(pushTimer);
+  pushTimer = setTimeout(pushDirty, 400);
+}
+function pushDirty() {
+  if (!user || !cloud || !gotSnapshot) return;
+  const ids = new Set(state.lists.map(l => l.id));
+  for (const l of state.lists) {
+    if (synced[l.id] === l.updated) continue;     // cloud already has this version
+    synced[l.id] = l.updated;
+    track(cloud.pushList(user.uid, l), l.id, "push");
+  }
+  for (const id of Object.keys(synced)) {
+    if (ids.has(id)) continue;                    // deleted here: delete in the cloud too
+    delete synced[id];
+    track(cloud.removeList(user.uid, id), id, "remove");
+  }
+  saveSynced();
+}
+// Called whenever the cloud tells us something changed.
+function applyRemote(snap) {
+  gotSnapshot = true;
+  let changed = false;
+  const remoteIds = new Set();
+  snap.forEach(d => remoteIds.add(d.id));
+
+  for (const ch of snap.docChanges()) {
+    const id = ch.doc.id;
+    if (ch.doc.metadata.hasPendingWrites) continue;   // that's just our own edit echoing back
+    if (ch.type === "removed") {
+      if (state.lists.some(l => l.id === id)) { state.lists = state.lists.filter(l => l.id !== id); changed = true; }
+      delete synced[id];
+      continue;
+    }
+    const remote = normalizeList({ ...ch.doc.data(), id }, state.lists.length);
+    const i = state.lists.findIndex(l => l.id === id);
+    if (i < 0) { state.lists.push(remote); synced[id] = remote.updated; changed = true; }
+    else if (remote.updated > state.lists[i].updated) { state.lists[i] = remote; synced[id] = remote.updated; changed = true; }
+    else if (remote.updated === state.lists[i].updated) synced[id] = remote.updated;
+    // else: our copy is newer (edited offline); pushDirty below uploads it
+  }
+
+  // A list we knew was in the cloud is gone from the server: it was deleted on another device.
+  if (!snap.metadata.fromCache) {
+    for (const l of [...state.lists]) {
+      if (synced[l.id] === undefined || remoteIds.has(l.id)) continue;
+      if (synced[l.id] === l.updated) { state.lists = state.lists.filter(x => x.id !== l.id); delete synced[l.id]; changed = true; }
+      else delete synced[l.id];                       // edited here since: keep it and upload again
+    }
+  }
+  saveSynced();
+  if (changed) { saveLocal(); render(); }
+  pushDirty();
+}
+function startSync() {
+  stopSync();
+  unsubscribe = cloud.subscribe(user.uid, applyRemote, err => console.warn("Sync error", err));
+}
+function stopSync() {
+  if (unsubscribe) unsubscribe();
+  unsubscribe = null; gotSnapshot = false;
+  clearTimeout(pushTimer);
+}
+async function signOutFlow() {
+  const unsent = pending > 0 || !navigator.onLine;
+  const msg = unsent
+    ? "Some changes may not have synced yet and would be lost. Sign out anyway?"
+    : "Sign out? Your lists will be removed from this device. They stay safe in your account.";
+  if (!confirm(msg)) return;
+  stopSync();
+  try { localStorage.removeItem(KEY); localStorage.removeItem(SYNCED_KEY); } catch (e) { /* ignore */ }
+  try { await cloud.signOutAndClear(); } catch (e) { console.warn(e); }
+  location.reload();
+}
+window.addEventListener("online", updateSync);
+window.addEventListener("offline", updateSync);
 
 // ---------- Helpers ----------
 function el(tag, props = {}, ...children) {
@@ -82,9 +204,53 @@ function render() {
   view.replaceChildren();
   view.classList.remove("enter");
   if (animateNext) { void view.offsetWidth; view.classList.add("enter"); animateNext = false; }
+
+  // Nothing is shown until we know who is signed in.
+  if (cloudError) return renderMessage("Can't reach the sign-in service. Check your internet connection.", boot);
+  if (!authReady) return renderMessage("Loading…");
+  if (!user) return renderLogin();
+  menuBtn.hidden = false;
+
   if (currentListId !== null && !currentList()) currentListId = null;
   if (currentListId === null) renderHome();
   else renderList(currentList());
+}
+
+// ----- Loading / error / sign-in screens -----
+function chromeOff() {
+  setAccent(DEFAULT_ACCENT);
+  titleEl.textContent = "Checklists";
+  backBtn.hidden = true; fab.hidden = true; menuBtn.hidden = true;
+  document.querySelector(".add-bar")?.remove();
+  updateSync();
+}
+function renderMessage(text, retry) {
+  chromeOff();
+  const box = el("div", { className: "empty", textContent: text });
+  if (retry) box.append(el("br"), el("br"), el("button", { className: "primary", textContent: "Try again", onclick: retry }));
+  view.append(box);
+}
+function renderLogin() {
+  chromeOff();
+  const email = el("input", { type: "email", name: "email", autocomplete: "username", placeholder: "Email", required: true, autocapitalize: "none", spellcheck: false });
+  const pw = el("input", { type: "password", name: "password", autocomplete: "current-password", placeholder: "Password", required: true });
+  const err = el("div", { className: "login-error", role: "alert" });
+  const btn = el("button", { className: "primary", type: "submit", textContent: "Sign in" });
+  const form = el("form", { className: "login" },
+    el("div", { className: "login-icon", textContent: "✓" }),
+    el("h2", { textContent: "Welcome back" }),
+    el("p", { className: "muted", textContent: "Sign in to see your checklists." }),
+    email, pw, err, btn);
+  form.onsubmit = async e => {
+    e.preventDefault();
+    err.textContent = ""; btn.disabled = true; btn.textContent = "Signing in…";
+    try { await cloud.signIn(email.value.trim(), pw.value); }   // success: the auth listener redraws
+    catch (ex) {
+      err.textContent = ex.message; btn.disabled = false; btn.textContent = "Sign in";
+      pw.value = ""; pw.focus();
+    }
+  };
+  view.append(form);
 }
 
 // ----- Home -----
@@ -220,11 +386,14 @@ function renderList(list) {
   existing?.remove();
   const input = el("input", { type: "text", placeholder: "Add an item…", maxLength: 200, enterKeyHint: "done" });
   const send = el("button", { type: "button", textContent: "↵", ariaLabel: "Add item" });
+  const listId = list.id;
   const add = () => {
     const text = input.value.trim();
-    if (!text) return;
-    list.items.push({ id: uid(), text, done: false });
-    touch(list); save();
+    // Look the list up again: it may have been replaced by a newer copy from the cloud.
+    const target = state.lists.find(l => l.id === listId);
+    if (!text || !target) return;
+    target.items.push({ id: uid(), text, done: false });
+    touch(target); save();
     input.value = ""; send.classList.remove("show");
     render();
     input.focus(); // keep typing
@@ -345,6 +514,7 @@ function buildMenu() {
   }
   btn("Export backup (file)", exportData);
   btn("Import backup", importData);
+  btn("Sign out", signOutFlow);
 }
 
 function exportData() {
@@ -359,7 +529,9 @@ function importData() {
       const data = JSON.parse(await inp.files[0].text());
       if (!Array.isArray(data.lists)) throw new Error("bad format");
       if (!confirm("Replace all current checklists with this backup?")) return;
-      state = migrate(data); save(); currentListId = null; render();
+      state = migrate(data);
+      state.lists.forEach(touch);   // mark as new edits so they upload
+      save(); currentListId = null; render();
     } catch (e) { alert("That file doesn't look like a valid backup."); }
   };
   inp.click();
@@ -373,7 +545,20 @@ document.addEventListener("click", () => { menu.hidden = true; });
 window.addEventListener("popstate", () => { if (currentListId !== null) { currentListId = null; render(); } });
 
 // ---------- Start ----------
-render();
+// Load the cloud module, then wait to hear whether someone is signed in.
+// (Loaded on demand so a failed network fetch shows a message instead of a blank page.)
+async function boot() {
+  cloudError = false;
+  render();
+  try { cloud = await import("./cloud.js"); }
+  catch (e) { console.warn("Cloud unavailable", e); cloudError = true; render(); return; }
+  cloud.onUser(u => {
+    user = u; authReady = true;
+    if (u) startSync(); else stopSync();
+    render(); updateSync();
+  });
+}
+boot();
 
 // Offline support + installability
 if ("serviceWorker" in navigator) {
