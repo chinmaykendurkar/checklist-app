@@ -1,6 +1,6 @@
 // Service worker: caches the app files so it works offline.
 // When you change any app file, bump CACHE so phones fetch the new version.
-const CACHE = "checklists-v5";
+const CACHE = "checklists-v6";
 const FILES = ["./", "index.html", "style.css", "app.js", "cloud.js", "manifest.webmanifest", "icon.svg", "icon-192.png", "icon-512.png"];
 
 self.addEventListener("install", e => {
@@ -21,7 +21,8 @@ self.addEventListener("fetch", e => {
     (url.hostname === "www.gstatic.com" && url.pathname.startsWith("/firebasejs/"));
   if (!ours) return;
   e.respondWith(
-    fetch(e.request).then(res => {
+    // "no-cache" = always ask GitHub for the latest copy (the browser's own cache could hand back an old one).
+    fetch(e.request, url.origin === location.origin ? { cache: "no-cache" } : {}).then(res => {
       const copy = res.clone();
       caches.open(CACHE).then(c => c.put(e.request, copy));
       return res;

@@ -515,7 +515,10 @@ function buildMenu() {
   btn("Export backup (file)", exportData);
   btn("Import checklists (file)", importData);
   btn("Sign out", signOutFlow);
+  menu.append(el("div", { className: "muted", textContent: "Version " + APP_VERSION,
+    style: "font-size:12px;padding:8px 14px 4px;opacity:.6" }));
 }
+const APP_VERSION = 6;   // bump together with CACHE in sw.js; shown at the bottom of the menu
 
 function exportData() {
   const blob = new Blob([JSON.stringify(state, null, 2)], { type: "application/json" });
