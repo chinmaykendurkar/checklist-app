@@ -2,7 +2,10 @@
 // All data lives in the browser's localStorage on THIS device.
 // Shape: { lists: [ { id, name, color, updated, items: [ { id, text, done } ] } ] }
 const KEY = "checklists-v1";
-const COLORS = ["#2563eb", "#16a34a", "#d97706", "#dc2626", "#9333ea", "#0891b2", "#db2777", "#475569"];
+// Soft pastel palette: blue, mint, peach, rose, lavender, aqua, pink, slate
+const COLORS = ["#9dbdff", "#94dcbc", "#ffd09b", "#ffa8b8", "#c8b0ff", "#8fdbe6", "#f6b0dc", "#bcc4d4"];
+// Colors from the first version of the app; mapped to the pastel one in the same position.
+const OLD_COLORS = ["#2563eb", "#16a34a", "#d97706", "#dc2626", "#9333ea", "#0891b2", "#db2777", "#475569"];
 const DEFAULT_ACCENT = COLORS[0];
 
 function load() {
@@ -18,6 +21,8 @@ function migrate(data) {
   if (!data || !Array.isArray(data.lists)) return { lists: [] };
   data.lists.forEach((l, i) => {
     l.items = Array.isArray(l.items) ? l.items : [];
+    const old = OLD_COLORS.indexOf(l.color);
+    if (old >= 0) l.color = COLORS[old];
     if (!l.color) l.color = COLORS[i % COLORS.length];
     if (!l.updated) l.updated = Date.now() - i;
   });
@@ -59,14 +64,24 @@ const stats = list => {
 };
 function setAccent(color) {
   document.documentElement.style.setProperty("--accent", color);
-  const meta = document.querySelector('meta[name="theme-color"]');
-  if (meta) meta.content = color;
+}
+
+// Navigation helper: switch screen with a gentle fade/slide-in
+let animateNext = false;
+let firstLoad = true;
+function go(listId) {
+  currentListId = listId;
+  animateNext = true;
+  render();
+  window.scrollTo(0, 0);
 }
 
 // ---------- Screens ----------
 function render() {
   menu.hidden = true;
   view.replaceChildren();
+  view.classList.remove("enter");
+  if (animateNext) { void view.offsetWidth; view.classList.add("enter"); animateNext = false; }
   if (currentListId !== null && !currentList()) currentListId = null;
   if (currentListId === null) renderHome();
   else renderList(currentList());
@@ -79,6 +94,8 @@ function renderHome() {
   backBtn.hidden = true;
   fab.hidden = false;
   document.querySelector(".add-bar")?.remove();
+  const entrance = view.classList.contains("enter") || firstLoad;  // blocks pop in only when arriving
+  firstLoad = false;
 
   if (state.lists.length === 0) {
     view.append(el("div", { className: "empty" },
@@ -89,14 +106,14 @@ function renderHome() {
 
   const search = el("input", { className: "search", type: "search", placeholder: "Search checklists or items…", value: query });
   const chips = el("div", { className: "chips" });
-  const grid = el("div", { className: "grid" });
+  const grid = el("div", { className: "grid" + (entrance ? " stagger" : "") });
 
   const drawChips = () => {
     chips.replaceChildren();
     for (const [key, label] of [["all", "All"], ["active", "In progress"], ["done", "Completed"]]) {
       chips.append(el("button", {
         className: "chip" + (filter === key ? " on" : ""), textContent: label,
-        onclick: () => { filter = key; drawChips(); drawGrid(); }
+        onclick: () => { filter = key; grid.classList.remove("stagger"); drawChips(); drawGrid(); }
       }));
     }
   };
@@ -126,10 +143,14 @@ function renderHome() {
       return;
     }
     grid.style.display = "";
-    for (const { list, s, hit } of matches) grid.append(makeBlock(list, s, hit));
+    matches.forEach(({ list, s, hit }, i) => {
+      const block = makeBlock(list, s, hit);
+      block.style.setProperty("--i", i);
+      grid.append(block);
+    });
   };
 
-  search.oninput = () => { query = search.value; drawGrid(); };
+  search.oninput = () => { query = search.value; grid.classList.remove("stagger"); drawGrid(); };
   view.append(search, chips, grid);
   drawChips();
   drawGrid();
@@ -155,7 +176,7 @@ function makeBlock(list, s, hit) {
     }
   }
   if (hit) block.append(el("div", { className: "hit", textContent: `Item: ${hit}` }));
-  block.onclick = () => { currentListId = list.id; render(); window.scrollTo(0, 0); };
+  block.onclick = () => go(list.id);
   return block;
 }
 
@@ -167,11 +188,14 @@ function renderList(list) {
   fab.hidden = true;
 
   const s = stats(list);
+  summaryRefs = {
+    count: el("span", { textContent: `${s.done} of ${s.total} done` }),
+    pct: el("span", { textContent: `${s.pct}%` }),
+    fill: el("div", { style: `width:${s.pct}%` }),
+  };
   view.append(el("div", { className: "summary" },
-    el("div", { className: "top" },
-      el("span", { textContent: `${s.done} of ${s.total} done` }),
-      el("span", { textContent: `${s.pct}%` })),
-    el("div", { className: "bar" }, el("div", { style: `width:${s.pct}%` }))));
+    el("div", { className: "top" }, summaryRefs.count, summaryRefs.pct),
+    el("div", { className: "bar" }, summaryRefs.fill)));
 
   view.append(el("div", { className: "toolbar" },
     el("button", { className: "secondary", textContent: "↺ Uncheck all", onclick: () => {
@@ -189,24 +213,48 @@ function renderList(list) {
     view.append(card);
   }
 
-  // Add-item bar, fixed at the bottom (easy to reach on a phone)
-  document.querySelector(".add-bar")?.remove();
+  // Add-item bar, fixed at the bottom (easy to reach on a phone).
+  // It stays in place between re-renders so the phone keyboard doesn't flicker.
+  const existing = document.querySelector(".add-bar");
+  if (existing && existing.dataset.list === list.id) return;
+  existing?.remove();
   const input = el("input", { type: "text", placeholder: "Add an item…", maxLength: 200, enterKeyHint: "done" });
+  const send = el("button", { type: "button", textContent: "↵", ariaLabel: "Add item" });
   const add = () => {
     const text = input.value.trim();
     if (!text) return;
     list.items.push({ id: uid(), text, done: false });
-    touch(list); save(); render();
-    document.querySelector(".add-bar input").focus(); // keep typing
+    touch(list); save();
+    input.value = ""; send.classList.remove("show");
+    render();
+    input.focus(); // keep typing
   };
+  input.oninput = () => send.classList.toggle("show", input.value.trim() !== "");
   input.onkeydown = e => { if (e.key === "Enter") add(); };
-  document.body.append(el("div", { className: "add-bar" },
-    el("div", { className: "inner" }, input, el("button", { className: "primary", textContent: "Add", onclick: add }))));
+  send.onclick = add;
+  const bar = el("div", { className: "add-bar" }, el("div", { className: "inner" }, input, send));
+  bar.dataset.list = list.id;
+  document.body.append(bar);
+}
+
+// Update the progress summary without redrawing the whole list (keeps animations smooth)
+let summaryRefs = null;
+function refreshSummary(list) {
+  if (!summaryRefs) return;
+  const s = stats(list);
+  summaryRefs.count.textContent = `${s.done} of ${s.total} done`;
+  summaryRefs.pct.textContent = `${s.pct}%`;
+  summaryRefs.fill.style.width = s.pct + "%";
 }
 
 function makeItemRow(list, item) {
   const cb = el("input", { type: "checkbox", checked: item.done });
-  cb.onchange = () => { item.done = cb.checked; touch(list); save(); render(); };
+  let row;
+  cb.onchange = () => {
+    item.done = cb.checked; touch(list); save();
+    row.classList.toggle("done", item.done);   // animate in place, no full redraw
+    refreshSummary(list);
+  };
 
   const text = el("span", { className: "text", textContent: item.text, title: "Tap to edit" });
   text.onclick = () => {
@@ -230,7 +278,8 @@ function makeItemRow(list, item) {
   const del = el("button", { className: "del", textContent: "✕", title: "Delete item" });
   del.onclick = () => { list.items = list.items.filter(i => i.id !== item.id); touch(list); save(); render(); };
 
-  return el("div", { className: "item" + (item.done ? " done" : "") }, cb, text, del);
+  row = el("div", { className: "item" + (item.done ? " done" : "") }, cb, text, del);
+  return row;
 }
 
 // ---------- New / edit checklist dialog ----------
@@ -259,7 +308,7 @@ function openListDialog(list) {
     } else {
       const created = { id: uid(), name: n, color, updated: Date.now(), items: [] };
       state.lists.push(created); save(); dlg.close();
-      currentListId = created.id; render();
+      go(created.id);
     }
   };
   name.onkeydown = e => { if (e.key === "Enter") { e.preventDefault(); submit(); } };
@@ -285,12 +334,12 @@ function buildMenu() {
       const src = currentList();
       const copy = { id: uid(), name: src.name + " (copy)", color: src.color, updated: Date.now(),
         items: src.items.map(i => ({ id: uid(), text: i.text, done: false })) };
-      state.lists.push(copy); save(); currentListId = copy.id; render();
+      state.lists.push(copy); save(); go(copy.id);
     });
     btn("Delete list", () => {
       if (confirm(`Delete "${currentList().name}"?`)) {
         state.lists = state.lists.filter(l => l.id !== currentListId);
-        save(); currentListId = null; render();
+        save(); go(null);
       }
     }, "danger");
   }
@@ -317,7 +366,7 @@ function importData() {
 }
 
 // ---------- Events ----------
-backBtn.onclick = () => { currentListId = null; render(); };
+backBtn.onclick = () => go(null);
 fab.onclick = () => openListDialog(null);
 menuBtn.onclick = e => { e.stopPropagation(); buildMenu(); menu.hidden = !menu.hidden; };
 document.addEventListener("click", () => { menu.hidden = true; });
