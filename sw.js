@@ -1,6 +1,6 @@
 // Service worker: caches the app files so it works offline.
 // When you change any app file, bump CACHE so phones fetch the new version.
-const CACHE = "checklists-v1";
+const CACHE = "checklists-v2";
 const FILES = ["./", "index.html", "style.css", "app.js", "manifest.webmanifest", "icon.svg", "icon-192.png", "icon-512.png"];
 
 self.addEventListener("install", e => {
